@@ -1,3 +1,6 @@
+**Dependencies**
+Make sure you have paramiko installed on solve.it platform.
+
 **Basic Usage In solve.it**
 ```
 import remote_connect
