@@ -1,312 +1,231 @@
-"""
-Remote VMS Connection Module
-=============================
-
-Provides tools for connecting to and executing commands on a remote VMS server
-via SSH using paramiko. Includes IPython magic commands for interactive use.
-
-Usage:
-    from remote_connect import setup_venv
-    
-    # In IPython/Jupyter:
-    %%vms
-    ls -la
-    
-    %%vms python
-    print("Hello from remote!")
-"""
-
 import paramiko
+import threading
+import time
 from IPython.core.magic import register_cell_magic
+from IPython import get_ipython
 
 
-def load_connection_config(config_file='connection_config.txt'):
-    """
-    Load SSH connection configuration from a text file.
-    
-    Args:
-        config_file (str): Path to configuration file. Default: 'connection_config.txt'
+class VMSConnection:
+    def __init__(self, hostname, username, password=None, key_filename=None, 
+                 port=22, tmux_session='vms_session', venv_name='venv'):
+        self.hostname = hostname
+        self.username = username
+        self.password = password
+        self.key_filename = key_filename
+        self.port = port
+        self.tmux_session = tmux_session
+        self.venv_name = venv_name
         
-    Returns:
-        dict: Configuration dictionary with keys: hostname, port, username, password
+        self.ssh_client = None
+        self.sftp_client = None
+        self.keepalive_thread = None
+        self.connected = False
         
-    Expected file format:
-        hostname=example.com
-        port=22
-        username=myuser
-        password=mypass
-    """
+    def connect(self):
+        try:
+            self.ssh_client = paramiko.SSHClient()
+            self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            
+            connect_kwargs = {
+                'hostname': self.hostname,
+                'port': self.port,
+                'username': self.username,
+            }
+            
+            if self.password:
+                connect_kwargs['password'] = self.password
+            if self.key_filename:
+                connect_kwargs['key_filename'] = self.key_filename
+                
+            self.ssh_client.connect(**connect_kwargs)
+            self.sftp_client = self.ssh_client.open_sftp()
+            self._setup_tmux_session()
+            
+            self.connected = True
+            self.keepalive_thread = threading.Thread(target=self._keepalive, daemon=True)
+            self.keepalive_thread.start()
+            
+            print(f"✓ Connected to {self.hostname} (tmux session: {self.tmux_session})")
+            
+        except Exception as e:
+            print(f"✗ Connection failed: {e}")
+            raise
+            
+    def _setup_tmux_session(self):
+        check_cmd = f"tmux has-session -t {self.tmux_session} 2>/dev/null"
+        stdin, stdout, stderr = self.ssh_client.exec_command(check_cmd)
+        exit_code = stdout.channel.recv_exit_status()
+        
+        if exit_code != 0:
+            create_cmd = f"tmux new-session -d -s {self.tmux_session}"
+            self.ssh_client.exec_command(create_cmd)
+            print(f"Creating default tmux session: {self.tmux_session}")
+            
+        
+    def execute(self, command):
+        if not self.connected: raise RuntimeError("Not connected. Call connect() first.")
+        stdin, stdout, stderr = self.ssh_client.exec_command(command)
+        output = stdout.read().decode('utf-8')
+        error = stderr.read().decode('utf-8')
+        exit_code = stdout.channel.recv_exit_status()
+        return output, error, exit_code
+
+    def run_python_file(self, filename, venv_name=None):
+        if venv_name is None: venv_name = self.venv_name
+        run_cmd = f"source {venv_name}/bin/activate && python {filename}"
+        print(f"Running {filename} in {venv_name}")
+        output, error, exit_code = self.execute(run_cmd)
+        if output: print(output.strip())
+        if error: print(f"Error: {error.strip()}")
+
+
+    def execute_and_print(self, commands):
+        for cmd in commands.strip().split('\n'):
+            cmd = cmd.strip()
+            if not cmd or cmd.startswith('#'):
+                continue
+                
+            print(f"$ {cmd}")
+            output, error, exit_code = self.execute(cmd)
+            
+            if output:
+                print(output)
+            if error:
+                print(f"Error: {error}")
+                
+    def create_venv(self, venv_name=None):
+        if venv_name is None:
+            venv_name = self.venv_name
+            
+        print(f"Creating virtual environment: {venv_name}")
+        self.execute_and_print(f"python3 -m venv {venv_name}")
+        print(f"✓ Virtual environment '{venv_name}' created")
+        
+    def install_packages(self, packages, venv_name=None):
+        if venv_name is None:
+            venv_name = self.venv_name
+            
+        if isinstance(packages, str):
+            packages = [packages]
+            
+        pip_cmd = f"source {venv_name}/bin/activate && pip install {' '.join(packages)}"
+        print(f"Installing packages: {', '.join(packages)}")
+        self.execute_and_print(pip_cmd)
+        print(f"✓ Packages installed")
+        
+        
+    def write_and_run(self, filename, code, venv_name=None):
+        self.write_file(filename, code)
+        self.run_python_file(filename, venv_name)
+                
+    def write_file(self, remote_path, content):
+        if not self.connected:
+            raise RuntimeError("Not connected. Call connect() first.")
+            
+        with self.sftp_client.open(remote_path, 'w') as f:
+            if isinstance(content, str):
+                content = content.encode('utf-8')
+            f.write(content)
+            
+        print(f"✓ Wrote to {remote_path}")
+        
+    def read_file(self, remote_path):
+        if not self.connected:
+            raise RuntimeError("Not connected. Call connect() first.")
+            
+        with self.sftp_client.open(remote_path, 'r') as f:
+            content = f.read().decode('utf-8')
+            
+        return content
+        
+    def upload_file(self, local_path, remote_path):
+        if not self.connected:
+            raise RuntimeError("Not connected. Call connect() first.")
+            
+        self.sftp_client.put(local_path, remote_path)
+        print(f"✓ Uploaded {local_path} → {remote_path}")
+        
+    def download_file(self, remote_path, local_path):
+        if not self.connected:
+            raise RuntimeError("Not connected. Call connect() first.")
+            
+        self.sftp_client.get(remote_path, local_path)
+        print(f"✓ Downloaded {remote_path} → {local_path}")
+        
+    def _keepalive(self):
+        while self.connected:
+            try:
+                transport = self.ssh_client.get_transport()
+                if transport and transport.is_active():
+                    transport.send_ignore()
+                else:
+                    print("⚠ Connection lost")
+                    self.connected = False
+                    break
+            except Exception as e:
+                print(f"⚠ Keepalive error: {e}")
+                self.connected = False
+                break
+                
+            time.sleep(60)
+            
+    def disconnect(self):
+        self.connected = False
+        
+        if self.sftp_client:
+            self.sftp_client.close()
+            
+        if self.ssh_client:
+            self.ssh_client.close()
+            
+        print(f"✓ Disconnected from {self.hostname}")
+
+
+vms_conn = None
+
+
+def load_config(config_file='connection_config.txt'):
     config = {}
     with open(config_file, 'r') as f:
         for line in f:
             line = line.strip()
-            if '=' in line and not line.startswith('#'):
+            if line and not line.startswith('#'):
                 key, value = line.split('=', 1)
-                key = key.strip()
-                value = value.strip()
-                # Convert port to integer
-                if key == 'port':
-                    value = int(value)
-                config[key] = value
+                config[key.strip()] = value.strip()
     return config
 
 
-def initialize_connection():
-    """
-    Initialize and test the SSH connection using configuration from file.
+def setup_vms_connection(config_file='connection_config.txt'):
+    global vms_conn
     
-    Returns:
-        tuple: (hostname, port, username, password) or (None, None, None, None) on failure
-    """
-    try:
-        secrets = load_connection_config('connection_config.txt')
-        hostname = secrets['hostname']
-        port = secrets['port']
-        username = secrets['username']
-        password = secrets['password']
-        
-        # Test connection
-        print(f"Connecting to {hostname}:{port} as {username}...")
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname=hostname, port=port, username=username, password=password, timeout=10)
-        print("✓ Connection successful!\n")
-        client.close()
-        
-        return hostname, port, username, password
-    except FileNotFoundError:
-        print("⚠ Warning: connection_config.txt not found. Please create it first.")
-        return None, None, None, None
-    except Exception as e:
-        print(f"✗ Connection failed: {e}\n")
-        return None, None, None, None
-
-
-# Initialize connection credentials
-hostname, port, username, password = initialize_connection()
-
-
-@register_cell_magic
-def vms(line, cell):
-    """
-    Unified VMS cell magic command for executing shell and Python commands remotely.
+    config = load_config(config_file)
     
-    This IPython magic command allows you to execute shell commands or Python code
-    on a remote VMS server. It supports virtual environments and persistent scripts.
-    
-    Usage:
-        %%vms
-        # Execute shell commands
-        ls -la
-        
-        %%vms python
-        # Execute Python (uses venv if available)
-        print("Hello!")
-        
-        %%vms python:ml_env
-        # Execute Python with specific venv
-        import numpy as np
-        
-        %%vms python persistent script.py
-        # Append to file and execute
-        
-        %%vms python:ml_env persistent script.py
-        # Append to file and execute in venv
-    
-    Args:
-        line (str): Command line arguments (mode specification)
-        cell (str): Cell content to execute
-    """
-    if not hostname:
-        print("✗ Error: No connection configured. Please run initialize_connection() first.")
-        return
-    
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(hostname=hostname, port=port, username=username, password=password, timeout=10)
-    
-    line = line.strip()
-    
-    # Mode 1: Shell commands (default)
-    if not line or not line.startswith('python'):
-        stdin, stdout, stderr = client.exec_command(cell)
-        output = stdout.read().decode()
-        errors = stderr.read().decode()
-        
-        client.close()
-        
-        if errors:
-            print("STDERR:", errors)
-        if output:
-            print(output)
-        return
-    
-    # Parse Python modes
-    venv_name = None
-    persistent = False
-    filename = 'persistent.py'
-    
-    # Check if specific venv is specified (python:venv_name)
-    if ':' in line:
-        prefix, rest = line.split(':', 1)
-        rest_parts = rest.strip().split()
-        venv_name = rest_parts[0]
-        
-        # Check for persistent mode
-        if len(rest_parts) > 1 and rest_parts[1] == 'persistent':
-            persistent = True
-            if len(rest_parts) > 2:
-                filename = rest_parts[2]
-    else:
-        # No specific venv, check for persistent mode
-        parts = line.split()
-        if len(parts) > 1 and parts[1] == 'persistent':
-            persistent = True
-            if len(parts) > 2:
-                filename = parts[2]
-    
-    # Determine which Python to use
-    if venv_name:
-        # Use specified venv
-        python_cmd = f'{venv_name}/bin/python3'
-    else:
-        # Auto-detect default venv
-        default_venv = 'ml_env'
-        stdin, stdout, stderr = client.exec_command(f'test -f {default_venv}/bin/python3 && echo "yes" || echo "no"')
-        venv_exists = stdout.read().decode().strip() == "yes"
-        python_cmd = f'{default_venv}/bin/python3' if venv_exists else 'python3'
-    
-    # Mode 2 & 3: Python execution (non-persistent)
-    if not persistent:
-        command = f'{python_cmd} << EOF\n{cell}\nEOF'
-        stdin, stdout, stderr = client.exec_command(command)
-        output = stdout.read().decode()
-        errors = stderr.read().decode()
-        
-        client.close()
-        
-        if errors:
-            print("STDERR:", errors)
-        if output:
-            print(output)
-        return
-    
-    # Mode 4 & 5: Persistent Python execution
-    command = f'cat >> {filename} << EOF\n{cell}\nEOF\n{python_cmd} {filename}'
-    stdin, stdout, stderr = client.exec_command(command)
-    output = stdout.read().decode()
-    errors = stderr.read().decode()
-    
-    client.close()
-    
-    if errors:
-        print("STDERR:", errors)
-    if output:
-        print(output)
-
-
-def setup_venv(venv_name='ml_env', packages=None, force_reinstall=False):
-    """
-    Set up a Python virtual environment on the remote machine with ML packages.
-    
-    Creates a virtual environment on the remote server and installs specified packages.
-    Useful for setting up isolated Python environments with machine learning libraries.
-    
-    Args:
-        venv_name (str): Name of the virtual environment. Default: 'ml_env'
-        packages (list): List of package names to install. 
-                        Default: ['numpy', 'pandas', 'matplotlib', 'scikit-learn', 'fastai', 'tinygrad']
-        force_reinstall (bool): If True, removes existing venv and creates fresh one. Default: False
-    
-    Example:
-        setup_venv('my_env', ['numpy', 'scipy', 'matplotlib'])
-        setup_venv('ml_env', force_reinstall=True)
-    """
-    if not hostname:
-        print("✗ Error: No connection configured. Please run initialize_connection() first.")
-        return
-    
-    if packages is None:
-        packages = ['numpy', 'pandas', 'matplotlib']
-    
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(hostname=hostname, port=port, username=username, password=password, timeout=10)
-    
-    print(f"Setting up virtual environment: {venv_name}")
-    print("=" * 60)
-    
-    # Step 1: Remove existing venv if force_reinstall
-    if force_reinstall:
-        print("\n1. Removing existing virtual environment...")
-        stdin, stdout, stderr = client.exec_command(f'rm -rf {venv_name}')
-        stdout.channel.recv_exit_status()
-        print("   ✓ Cleaned up old environment")
-    
-    # Step 2: Check if venv exists
-    print("\n2. Checking for existing virtual environment...")
-    stdin, stdout, stderr = client.exec_command(f'test -d {venv_name} && echo "exists" || echo "not found"')
-    exists = stdout.read().decode().strip()
-    
-    if exists == "not found":
-        print(f"   Creating new virtual environment: {venv_name}")
-        stdin, stdout, stderr = client.exec_command(f'python3 -m venv {venv_name}')
-        stdout.channel.recv_exit_status()
-        print("   ✓ Virtual environment created")
-    else:
-        print(f"   ✓ Virtual environment already exists: {venv_name}")
-    
-    # Step 3: Upgrade pip
-    print("\n3. Upgrading pip...")
-    stdin, stdout, stderr = client.exec_command(
-        f'{venv_name}/bin/pip install --upgrade pip'
-    )
-    stdout.channel.recv_exit_status()
-    print("   ✓ Pip upgraded")
-    
-    # Step 4: Install packages
-    print("\n4. Installing packages...")
-    packages_str = ' '.join(packages)
-    print(f"   Installing: {packages_str}")
-    
-    stdin, stdout, stderr = client.exec_command(
-        f'{venv_name}/bin/pip install {packages_str}'
+    vms_conn = VMSConnection(
+        hostname=config.get('hostname'),
+        username=config.get('username'),
+        password=config.get('password'),
+        key_filename=config.get('key_filename'),
+        port=int(config.get('port', 22)),
+        tmux_session=config.get('tmux_session', 'vms_session'),
+        venv_name=config.get('venv_name', 'venv')
     )
     
-    # Stream output
-    while True:
-        line = stdout.readline()
-        if not line:
-            break
-        print(f"   {line.rstrip()}")
+    vms_conn.connect()
     
-    stdout.channel.recv_exit_status()
-    
-    # Step 5: Verify installation
-    print("\n5. Verifying installation...")
-    package_pattern = '|'.join(packages)
-    stdin, stdout, stderr = client.exec_command(
-        f'{venv_name}/bin/pip list | grep -E "{package_pattern}"'
-    )
-    installed = stdout.read().decode()
-    print(f"\n   Installed packages:\n{installed}")
-    
-    client.close()
-    
-    print("\n" + "=" * 60)
-    print("✓ Virtual environment setup complete!")
-    print(f"\nUsage:")
-    print(f"   %%vms python:{venv_name}")
-    print(f"   %%vms python:{venv_name} persistent script.py")
-    print("=" * 60)
-
-
-# Print usage information when module is loaded
-if hostname:
-    print("✓ VMS Magic command ready:")
-    print("  - %%vms                                      : Execute shell commands")
-    print("  - %%vms python                               : Execute Python (auto venv)")
-    print("  - %%vms python:venv_name                     : Execute Python (specific venv)")
-    print("  - %%vms python persistent file.py            : Persistent Python (auto venv)")
-    print("  - %%vms python:venv_name persistent file.py  : Persistent Python (specific venv)")
-    print("  - setup_venv(name, packages, force)          : Setup virtual environment")
+    @register_cell_magic
+    def vms(line, cell):
+        if vms_conn is None or not vms_conn.connected:
+            print("✗ Not connected. Run setup_vms_connection() first.")
+            return
+        
+        line = line.strip()
+        
+        if line:
+            parts = line.split()
+            if len(parts) == 2:
+                venv_name, filename = parts[0], parts[1]
+                vms_conn.write_and_run(filename, cell, venv_name)
+            else:
+                vms_conn.execute_and_print(cell)
+        else:
+            vms_conn.execute_and_print(cell)
