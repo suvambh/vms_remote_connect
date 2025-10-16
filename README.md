@@ -1,3 +1,22 @@
+**Basic Usage In solve.it**
+```
+import remote_connect
+
+remote_connect.setup_vms_connection('connection_config.txt')
+conn = remote_connect.vms_conn
+
+conn.create_venv('my_venv')
+conn.install_packages(['numpy', 'pandas'], 'my_venv')
+
+conn.write_file('script.py', 'print("Hello from remote!")')
+conn.run_python_file('script.py', 'my_venv')
+
+conn.execute_and_print('ls -la')
+
+conn.disconnect()
+```
+
+
 **Persistent SSH Connection with Keepalive**
 
 The connection uses paramiko's SSH client with a background keepalive mechanism to prevent timeouts. A daemon thread runs every 60 seconds sending `transport.send_ignore()` packets to maintain the TCP connection. The thread monitors `transport.is_active()` and sets `self.connected = False` if the connection drops, preventing operations on a dead socket.
