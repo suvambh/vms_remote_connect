@@ -1,163 +1,25 @@
-## VMS Remote Execution System
+**Persistent SSH Connection with Keepalive**
 
-A Python-based system for executing commands, Python scripts, and managing virtual environments on a remote VMS (Virtual Machine Server) via SSH using Paramiko.
+The connection uses paramiko's SSH client with a background keepalive mechanism to prevent timeouts. A daemon thread runs every 60 seconds sending `transport.send_ignore()` packets to maintain the TCP connection. The thread monitors `transport.is_active()` and sets `self.connected = False` if the connection drops, preventing operations on a dead socket.
 
-### Overview
+**Tmux Session Management**
 
-This system provides a Jupyter magic command (`%%vms`) that allows you to execute shell commands and Python code on a remote server directly from your notebook, with support for virtual environments and persistent script files.
+On connection, the system checks for an existing tmux session using `tmux has-session -t {session_name}` and inspects the exit code. If the session doesn't exist (exit_code != 0), it creates a detached session with `tmux new-session -d -s {session_name}`. This provides a persistent shell environment that survives SSH disconnections.
 
-### Components
+To execute commands in the tmux session, you'd use: `tmux send-keys -t {session_name} "command" C-m` which sends the command and a carriage return. The current implementation uses direct `exec_command()` for simplicity, but could be extended to use tmux for truly persistent execution contexts.
 
-**1. Connection Configuration**
+**SFTP File Operations**
 
-The system loads SSH connection details from a `connection_config.txt` file with the following format:
+The SFTP subsystem is opened via `ssh_client.open_sftp()` which returns a persistent SFTP client. File operations use `sftp_client.open(path, mode)` which returns a file-like object supporting read/write. The `write_file` method handles both string and bytes, encoding strings to UTF-8. The `put()` and `get()` methods transfer entire files efficiently using the SFTP protocol's optimized transfer mechanisms.
 
-```
-hostname=your.server.com
-port=22
-username=your_username
-password=your_password
-```
+**Virtual Environment Activation**
 
-**2. Main Functions**
+Commands run in venvs use shell command chaining: `source {venv}/bin/activate && command`. The `source` activates the venv in the current shell context, modifying `$PATH` and `$VIRTUAL_ENV`. The `&&` ensures the second command only runs if activation succeeds. Each `exec_command()` spawns a new shell, so activation must happen in the same command string.
 
-**`load_connection_config(config_file='connection_config.txt')`**
+**Cell Magic Implementation**
 
-Loads SSH connection parameters from a configuration file.
+The `@register_cell_magic` decorator registers `%%vms` with IPython. When invoked, the `line` parameter contains arguments after `%%vms`, and `cell` contains the code block. The magic parses the line to determine if it's `venv_name filename` (two parts) for Python execution, or treats the cell as shell commands otherwise. The `get_ipython()` function provides access to the IPython instance for runtime registration.
 
-- **Parameters**: `config_file` - Path to configuration file (default: 'connection_config.txt')
-- **Returns**: Dictionary with connection parameters (hostname, port, username, password)
-- **Note**: Automatically converts port to integer
+**Exit Code Handling**
 
-**`setup_venv(venv_name='ml_env', packages=None, force_reinstall=False)`**
-
-Creates and configures a Python virtual environment on the remote server with specified packages.
-
-- **Parameters**:
-  - `venv_name` - Name of virtual environment (default: 'ml_env')
-  - `packages` - List of packages to install (default: ['numpy', 'pandas', 'matplotlib', 'scikit-learn', 'fastai', 'tinygrad'])
-  - `force_reinstall` - If True, removes existing venv before creating new one (default: False)
-
-- **Process**:
-  1. Optionally removes existing environment
-  2. Creates new virtual environment if needed
-  3. Upgrades pip
-  4. Installs specified packages
-  5. Verifies installation
-
-### Magic Command: `%%vms`
-
-A unified cell magic for executing commands on the remote server.
-
-**Mode 1: Shell Commands**
-```python
-%%vms
-ls -la
-pwd
-echo "Hello from VMS"
-```
-
-**Mode 2: Python Execution (Auto-detect venv)**
-```python
-%%vms python
-import numpy as np
-print(np.array([1, 2, 3]))
-```
-Automatically uses `ml_env` virtual environment if available, otherwise uses system Python.
-
-**Mode 3: Python with Specific Virtual Environment**
-```python
-%%vms python:my_custom_env
-import pandas as pd
-print(pd.__version__)
-```
-
-**Mode 4: Persistent Python Script (Auto venv)**
-```python
-%%vms python persistent script.py
-def hello():
-    print("This gets appended to script.py")
-hello()
-```
-Appends code to file and executes it. Each cell adds to the same file.
-
-**Mode 5: Persistent Python with Specific Virtual Environment**
-```python
-%%vms python:ml_env persistent my_analysis.py
-import matplotlib.pyplot as plt
-plt.plot([1, 2, 3])
-plt.savefig('output.png')
-```
-
-### Usage Examples
-
-**Setting up a virtual environment:**
-```python
-# Basic setup with default packages
-setup_venv()
-
-# Custom environment with specific packages
-setup_venv('data_science', ['numpy', 'scipy', 'jupyter'])
-
-# Force reinstall
-setup_venv('ml_env', force_reinstall=True)
-```
-
-**Running shell commands:**
-```python
-%%vms
-df -h
-free -m
-nvidia-smi
-```
-
-**Quick Python calculations:**
-```python
-%%vms python
-result = sum(range(1000000))
-print(f"Sum: {result}")
-```
-
-**Building a persistent script incrementally:**
-```python
-%%vms python persistent analysis.py
-import pandas as pd
-data = pd.read_csv('data.csv')
-```
-
-```python
-%%vms python persistent analysis.py
-# This appends to the same file
-result = data.describe()
-print(result)
-```
-
-### Features
-
-- **Automatic venv detection**: Uses `ml_env` by default if available
-- **Multiple execution modes**: Shell, Python (ephemeral), and persistent scripts
-- **Error handling**: Displays both stdout and stderr
-- **Connection testing**: Verifies SSH connection on startup
-- **Streaming output**: Real-time feedback during package installation
-- **Flexible configuration**: File-based connection settings
-
-### Security Notes
-
-- Connection credentials are stored in plain text in `connection_config.txt`
-- Ensure this file has appropriate permissions (`chmod 600`)
-- Consider using SSH keys instead of passwords for production use
-- The system uses `AutoAddPolicy` for host keys - verify host fingerprints manually for security-critical applications
-
-### Error Handling
-
-The system provides clear feedback for common issues:
-- Missing configuration file
-- Connection failures
-- Command execution errors (displayed as STDERR output)
-
-### Requirements
-
-- `paramiko` - SSH client library
-- `IPython` - For magic command registration
-- Remote server with SSH access
-- Python 3 on remote server (for Python execution modes)
+The `execute()` method uses `stdout.channel.recv_exit_status()` which blocks until the remote command completes and returns its exit code. This is more reliable than checking `stderr` since commands can write to stderr without failing. Exit codes follow Unix conventions: 0 for success, non-zero for failure.
