@@ -70,13 +70,27 @@ class VMSConnection:
         exit_code = stdout.channel.recv_exit_status()
         return output, error, exit_code
 
+
+    def execute_streaming(self, command):
+        if not self.connected: raise RuntimeError("Not connected. Call connect() first.")
+        stdin, stdout, stderr = self.ssh_client.exec_command(command)
+        channel = stdout.channel
+        while not channel.exit_status_ready():
+            if channel.recv_ready():
+                data = channel.recv(1024).decode('utf-8')
+                print(data, end='', flush=True)
+            time.sleep(0.1)
+        while channel.recv_ready():
+            data = channel.recv(1024).decode('utf-8')
+            print(data, end='', flush=True)
+        exit_code = channel.recv_exit_status()
+        return exit_code
+
     def run_python_file(self, filename, venv_name=None):
         if venv_name is None: venv_name = self.venv_name
         run_cmd = f"source {venv_name}/bin/activate && python {filename}"
         print(f"Running {filename} in {venv_name}")
-        output, error, exit_code = self.execute(run_cmd)
-        if output: print(output.strip())
-        if error: print(f"Error: {error.strip()}")
+        self.execute_streaming(run_cmd)
 
 
     def execute_and_print(self, commands):
@@ -182,6 +196,23 @@ class VMSConnection:
 
 
 vms_conn = None
+
+
+def save_config(input_str, config_file='connection_config.txt'):
+    parts = input_str.strip().split()
+    hostname, port = parts[0].split(':') if ':' in parts[0] else (parts[0], '22')
+    username = parts[1]
+    password = parts[2] if len(parts) > 2 else ''
+    
+    with open(config_file, 'w') as f:
+        f.write(f"hostname={hostname}\n")
+        f.write(f"port={port}\n")
+        f.write(f"username={username}\n")
+        if password: f.write(f"password={password}\n")
+        f.write(f"tmux_session=vms_session\n")
+        f.write(f"venv_name=venv\n")
+    
+    print(f"✓ Config saved to {config_file}")
 
 
 def load_config(config_file='connection_config.txt'):
